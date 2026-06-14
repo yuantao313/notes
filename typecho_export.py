@@ -2,7 +2,9 @@
 """
 Typecho 文章导出工具
 - 通过 XML-RPC 拉取所有文章（含私密文章）
-- 转为 Markdown 上传到 Cloudflare R2（通过 Cloudflare API）
+- 转为 Markdown 上传到 Cloudflare R2
+- 内链转 Obsidian 格式，使用实际文件名
+- 文件名格式: yyyymmdd_title.md
 """
 
 import xmlrpc.client
@@ -20,7 +22,7 @@ USERNAME = os.environ["TYPECHO_USERNAME"]
 PASSWORD = os.environ["TYPECHO_PASSWORD"]
 
 CF_ACCOUNT_ID = os.environ["R2_ACCOUNT_ID"]
-CF_API_TOKEN = os.environ["R2_ACCESS_KEY_ID"]  # Cloudflare API Token (cfat_...)
+CF_API_TOKEN = os.environ["R2_ACCESS_KEY_ID"]
 R2_BUCKET = os.environ["R2_BUCKET"]
 R2_PREFIX = os.environ.get("R2_PREFIX", "posts/")
 # ===========================================
@@ -40,6 +42,31 @@ def slugify(text):
     return text or "untitled"
 
 
+def parse_date(dt):
+    """解析 xmlrpc.client.DateTime 为 datetime 对象"""
+    from datetime import datetime
+    if dt and hasattr(dt, "value"):
+        # dt.value 格式: "20260406T23:00:00"
+        return datetime.strptime(dt.value, "%Y%m%dT%H:%M:%S")
+    return None
+
+
+def get_filename(post):
+    """生成文件名: yyyymmdd_title.md"""
+    title = post.get("title", "无标题")
+    dt = parse_date(post.get("dateCreated"))
+    date_str = dt.strftime("%Y%m%d") if dt else "00000000"
+    return f"{date_str}_{slugify(title)}.md"
+
+
+def get_filename_no_ext(post):
+    """生成不带扩展名的文件名，用于 Obsidian 内链"""
+    title = post.get("title", "无标题")
+    dt = parse_date(post.get("dateCreated"))
+    date_str = dt.strftime("%Y%m%d") if dt else "00000000"
+    return f"{date_str}_{slugify(title)}"
+
+
 def convert_html_to_md(html_content):
     h = html2text.HTML2Text()
     h.body_width = 0
@@ -53,10 +80,13 @@ def build_frontmatter(post):
     lines = ["---"]
     lines.append(f'title: "{post["title"]}"')
 
-    if post.get("dateCreated"):
-        dt = post["dateCreated"]
-        if hasattr(dt, "strftime"):
-            lines.append(f'date: {dt.strftime("%Y-%m-%d %H:%M:%S")}')
+    dt = parse_date(post.get("dateCreated"))
+    if dt:
+        lines.append(f'date: {dt.strftime("%Y-%m-%d %H:%M:%S")}')
+
+    dm = parse_date(post.get("date_modified"))
+    if dm:
+        lines.append(f'updated: {dm.strftime("%Y-%m-%d %H:%M:%S")}')
 
     if post.get("categories"):
         lines.append(f"categories: {post['categories']}")
@@ -66,6 +96,9 @@ def build_frontmatter(post):
         if tags:
             lines.append(f"tags: {tags}")
 
+    if post.get("wp_author_display_name"):
+        lines.append(f'author: "{post["wp_author_display_name"]}"')
+
     if post.get("password"):
         lines.append(f'password: "{post["password"]}"')
         lines.append("status: private")
@@ -74,29 +107,31 @@ def build_frontmatter(post):
     else:
         lines.append("status: publish")
 
+    if post.get("link"):
+        lines.append(f'source: "{post["link"]}"')
+
     lines.append(f'post_id: {post.get("postid", "")}')
     lines.append("---")
     return "\n".join(lines)
 
 
-def build_markdown(post, id_to_title=None):
+def build_markdown(post, id_to_filename=None):
     content_html = post.get("description", "")
     more_html = post.get("mt_text_more", "")
     if more_html:
         content_html += "\n" + more_html
     content_md = convert_html_to_md(content_html)
 
-    # 内链转 Obsidian 格式: [text](url) -> [[title]] 或 [[title|text]]
-    if id_to_title:
-        site = TYPECHO_URL.rstrip("/")
+    # 内链转 Obsidian 格式: [text](url) -> [[filename]] 或 [[filename|text]]
+    if id_to_filename:
         def replace_link(m):
             text = m.group(1)
             url = m.group(2)
             match = re.search(r'/archives/(\d+)/', url)
             if match:
                 pid = match.group(1)
-                if pid in id_to_title:
-                    target = id_to_title[pid]
+                if pid in id_to_filename:
+                    target = id_to_filename[pid]
                     if text.strip() == target:
                         return f"[[{target}]]"
                     return f"[[{target}|{text}]]"
@@ -140,7 +175,6 @@ def cf_headers():
 
 
 def r2_list_keys(prefix):
-    """列出 R2 桶中指定前缀的所有 key"""
     keys = set()
     url = f"{CF_API}/objects"
     params = {"prefix": prefix}
@@ -153,7 +187,6 @@ def r2_list_keys(prefix):
         result = data.get("result", [])
         for obj in result:
             keys.add(obj["key"])
-        # 分页
         result_info = data.get("result_info", {})
         if not result or result_info.get("page", 0) >= result_info.get("total_pages", 1):
             break
@@ -162,7 +195,6 @@ def r2_list_keys(prefix):
 
 
 def r2_upload(key, content):
-    """上传文件到 R2"""
     url = f"{CF_API}/objects/{key}"
     resp = requests.put(
         url,
@@ -174,7 +206,6 @@ def r2_upload(key, content):
 
 
 def r2_delete(key):
-    """删除 R2 中的文件"""
     url = f"{CF_API}/objects/{key}"
     resp = requests.delete(url, headers=cf_headers())
     if not resp.json().get("success"):
@@ -208,24 +239,23 @@ def main():
     existing_keys = r2_list_keys(R2_PREFIX)
     print(f"  桶中现有 {len(existing_keys)} 个文件")
 
-    # 构建 post_id -> title 映射，用于内链转换
-    id_to_title = {p.get("postid", ""): p.get("title", "") for p in posts}
+    # 构建 post_id -> 文件名（无扩展名）映射，用于内链转换
+    id_to_filename = {p.get("postid", ""): get_filename_no_ext(p) for p in posts}
 
     uploaded_keys = set()
 
     for i, post in enumerate(posts, 1):
         title = post.get("title", "无标题")
-        post_id = post.get("postid", "0")
         is_private = post.get("password") or post.get("post_status") == "private"
         status = "私密" if is_private else "公开"
 
-        filename = f"{post_id}_{slugify(title)}.md"
+        filename = get_filename(post)
         r2_key = f"{R2_PREFIX}{filename}"
-        md = build_markdown(post, id_to_title)
+        md = build_markdown(post, id_to_filename)
 
         r2_upload(r2_key, md)
         uploaded_keys.add(r2_key)
-        print(f"  [{i}/{len(posts)}] [{status}] {title} -> {r2_key}")
+        print(f"  [{i}/{len(posts)}] [{status}] {title} -> {filename}")
 
     # 清理已删除的文章
     to_delete = existing_keys - uploaded_keys
