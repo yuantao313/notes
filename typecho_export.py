@@ -2,35 +2,28 @@
 """
 Typecho 文章导出工具
 - 通过 XML-RPC 拉取所有文章（含私密文章）
-- SHA256 hash 增量检测，仅上传变更文件
-- 支持导出到本地目录 + 上传到 Cloudflare R2
+- 转为 Markdown 上传到 Cloudflare R2
 """
 
 import xmlrpc.client
 import html2text
-import hashlib
-import json
 import os
 import re
 import sys
 import time
 import boto3
-from datetime import datetime
 
 
-# ========== 配置（环境变量覆盖）==========
+# ========== 配置（从环境变量读取）==========
 TYPECHO_URL = os.environ["TYPECHO_URL"]
 USERNAME = os.environ["TYPECHO_USERNAME"]
 PASSWORD = os.environ["TYPECHO_PASSWORD"]
-OUTPUT_DIR = os.environ.get("OUTPUT_DIR", "typecho_posts")
-HASH_FILE = os.environ.get("HASH_FILE", "typecho_posts/.hashes.json")
 
-# R2 配置
-R2_ACCOUNT_ID = os.environ.get("R2_ACCOUNT_ID")
-R2_ACCESS_KEY_ID = os.environ.get("R2_ACCESS_KEY_ID")
-R2_SECRET_ACCESS_KEY = os.environ.get("R2_SECRET_ACCESS_KEY")
-R2_BUCKET = os.environ.get("R2_BUCKET")
-R2_PREFIX = os.environ.get("R2_PREFIX", "posts/")  # 桶内路径前缀
+R2_ACCOUNT_ID = os.environ["R2_ACCOUNT_ID"]
+R2_ACCESS_KEY_ID = os.environ["R2_ACCESS_KEY_ID"]
+R2_SECRET_ACCESS_KEY = os.environ["R2_SECRET_ACCESS_KEY"]
+R2_BUCKET = os.environ["R2_BUCKET"]
+R2_PREFIX = os.environ.get("R2_PREFIX", "posts/")
 # ===========================================
 
 
@@ -85,33 +78,14 @@ def build_frontmatter(post):
     return "\n".join(lines)
 
 
-def extract_full_content(post):
+def build_markdown(post):
     content_html = post.get("description", "")
     more_html = post.get("mt_text_more", "")
     if more_html:
         content_html += "\n" + more_html
-    return content_html
-
-
-def compute_post_hash(post):
-    content_html = extract_full_content(post)
-    md_content = convert_html_to_md(content_html)
+    content_md = convert_html_to_md(content_html)
     frontmatter = build_frontmatter(post)
-    full = f"{frontmatter}\n\n{md_content}"
-    return hashlib.sha256(full.encode("utf-8")).hexdigest()
-
-
-def load_hashes():
-    if os.path.exists(HASH_FILE):
-        with open(HASH_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    return {}
-
-
-def save_hashes(hashes):
-    os.makedirs(os.path.dirname(HASH_FILE), exist_ok=True)
-    with open(HASH_FILE, "w", encoding="utf-8") as f:
-        json.dump(hashes, f, ensure_ascii=False, indent=2)
+    return f"{frontmatter}\n\n{content_md}"
 
 
 def fetch_all_posts(proxy, blog_id, username, password):
@@ -142,42 +116,6 @@ def fetch_all_posts(proxy, blog_id, username, password):
     return all_posts
 
 
-def build_markdown(post):
-    """生成单篇文章的完整 markdown 内容"""
-    content_html = extract_full_content(post)
-    content_md = convert_html_to_md(content_html)
-    frontmatter = build_frontmatter(post)
-    return f"{frontmatter}\n\n{content_md}"
-
-
-def get_r2_client():
-    if not all([R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY]):
-        return None
-    return boto3.client(
-        "s3",
-        endpoint_url=f"https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com",
-        aws_access_key_id=R2_ACCESS_KEY_ID,
-        aws_secret_access_key=R2_SECRET_ACCESS_KEY,
-        region_name="auto",
-    )
-
-
-def r2_upload(s3, bucket, key, content, content_type="text/markdown; charset=utf-8"):
-    s3.put_object(
-        Bucket=bucket,
-        Key=key,
-        Body=content.encode("utf-8"),
-        ContentType=content_type,
-    )
-
-
-def r2_delete(s3, bucket, key):
-    try:
-        s3.delete_object(Bucket=bucket, Key=key)
-    except Exception:
-        pass
-
-
 def main():
     rpc_url = get_xmlrpc_url(TYPECHO_URL)
     print(f"连接 Typecho XML-RPC: {rpc_url}")
@@ -200,105 +138,50 @@ def main():
         print("没有文章，退出。")
         return
 
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    # 初始化 R2
+    s3 = boto3.client(
+        "s3",
+        endpoint_url=f"https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com",
+        aws_access_key_id=R2_ACCESS_KEY_ID,
+        aws_secret_access_key=R2_SECRET_ACCESS_KEY,
+        region_name="auto",
+    )
 
-    # 初始化 R2 客户端
-    s3 = get_r2_client()
-    r2_enabled = s3 is not None and R2_BUCKET
-    if r2_enabled:
-        print(f"R2 桶: {R2_BUCKET}，前缀: {R2_PREFIX}")
-    else:
-        print("R2 未配置，仅导出本地文件")
+    # 拉取 R2 现有文件列表，用于清理已删除的文章
+    existing_keys = set()
+    paginator = s3.get_paginator("list_objects_v2")
+    for page in paginator.paginate(Bucket=R2_BUCKET, Prefix=R2_PREFIX):
+        for obj in page.get("Contents", []):
+            existing_keys.add(obj["Key"])
 
-    # 加载旧 hash
-    old_hashes = load_hashes()
-    new_hashes = {}
+    uploaded_keys = set()
 
-    added = []
-    updated = []
-    unchanged = []
-    removed_keys = set(old_hashes.keys())
-
-    for post in posts:
-        post_id = post.get("postid", "0")
+    for i, post in enumerate(posts, 1):
         title = post.get("title", "无标题")
+        post_id = post.get("postid", "0")
         is_private = post.get("password") or post.get("post_status") == "private"
         status = "私密" if is_private else "公开"
 
-        new_hash = compute_post_hash(post)
-        new_hashes[post_id] = {
-            "hash": new_hash,
-            "title": title,
-            "status": status,
-        }
-
         filename = f"{post_id}_{slugify(title)}.md"
-        filepath = os.path.join(OUTPUT_DIR, filename)
         r2_key = f"{R2_PREFIX}{filename}"
+        md = build_markdown(post)
 
-        old = old_hashes.get(post_id)
+        s3.put_object(
+            Bucket=R2_BUCKET,
+            Key=r2_key,
+            Body=md.encode("utf-8"),
+            ContentType="text/markdown; charset=utf-8",
+        )
+        uploaded_keys.add(r2_key)
+        print(f"  [{i}/{len(posts)}] [{status}] {title} -> {r2_key}")
 
-        if old is None:
-            # 新文章
-            md = build_markdown(post)
-            with open(filepath, "w", encoding="utf-8") as f:
-                f.write(md)
-            if r2_enabled:
-                r2_upload(s3, R2_BUCKET, r2_key, md)
-            added.append(f"[新增] [{status}] {title} -> {filename}")
+    # 清理 R2 上已删除的文章
+    to_delete = existing_keys - uploaded_keys
+    for key in to_delete:
+        s3.delete_object(Bucket=R2_BUCKET, Key=key)
+        print(f"  [删除] {key}")
 
-        elif old["hash"] != new_hash:
-            # 内容变化 - 删旧文件（文件名可能因标题改变）
-            old_filename = f"{post_id}_{slugify(old['title'])}.md"
-            old_path = os.path.join(OUTPUT_DIR, old_filename)
-            if os.path.exists(old_path):
-                os.remove(old_path)
-            if r2_enabled and old_filename != filename:
-                r2_delete(s3, R2_BUCKET, f"{R2_PREFIX}{old_filename}")
-
-            md = build_markdown(post)
-            with open(filepath, "w", encoding="utf-8") as f:
-                f.write(md)
-            if r2_enabled:
-                r2_upload(s3, R2_BUCKET, r2_key, md)
-            updated.append(f"[更新] [{status}] {title} -> {filename}")
-
-        else:
-            unchanged.append(f"[不变] [{status}] {title}")
-
-        removed_keys.discard(post_id)
-
-    # 处理已删除的文章
-    deleted = []
-    for post_id in removed_keys:
-        old_title = old_hashes[post_id]["title"]
-        old_filename = f"{post_id}_{slugify(old_title)}.md"
-        old_path = os.path.join(OUTPUT_DIR, old_filename)
-        if os.path.exists(old_path):
-            os.remove(old_path)
-        if r2_enabled:
-            r2_delete(s3, R2_BUCKET, f"{R2_PREFIX}{old_filename}")
-        deleted.append(f"[删除] {old_title}")
-
-    # 保存新 hash
-    save_hashes(new_hashes)
-
-    # 输出结果
-    for line in added:
-        print(f"  {line}")
-    for line in updated:
-        print(f"  {line}")
-    for line in deleted:
-        print(f"  {line}")
-    for line in unchanged:
-        print(f"  {line}")
-
-    print(f"\n汇总: 新增 {len(added)}, 更新 {len(updated)}, 删除 {len(deleted)}, 不变 {len(unchanged)}")
-
-    has_changes = bool(added or updated or deleted)
-    print(f"HAS_CHANGES={'true' if has_changes else 'false'}")
-
-    return has_changes
+    print(f"\n完成: 上传 {len(posts)} 篇, 清理 {len(to_delete)} 篇")
 
 
 if __name__ == "__main__":
