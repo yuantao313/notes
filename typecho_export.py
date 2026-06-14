@@ -132,13 +132,14 @@ def r2_list_keys(prefix):
         if not data.get("success"):
             print(f"  列表失败: {data.get('errors')}")
             break
-        for obj in data.get("result", []):
+        result = data.get("result", [])
+        for obj in result:
             keys.add(obj["key"])
         # 分页
         result_info = data.get("result_info", {})
-        if result_info.get("page", 0) >= result_info.get("total_pages", 1):
+        if not result or result_info.get("page", 0) >= result_info.get("total_pages", 1):
             break
-        params["cursor"] = data.get("result", [{}])[-1].get("key", "")
+        params["cursor"] = result[-1].get("key", "")
     return keys
 
 
