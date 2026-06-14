@@ -21,7 +21,7 @@ jobs:
           python-version: '3.12'
 
       - name: Install dependencies
-        run: pip install html2text boto3
+        run: pip install html2text requests
 
       - name: Sync to R2
         env:
