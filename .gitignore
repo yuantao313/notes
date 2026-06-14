@@ -1,0 +1,6 @@
+.omc/
+.venv/
+__pycache__/
+*.pyc
+export.log
+typecho_posts/
