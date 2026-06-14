@@ -2,7 +2,7 @@
 """
 Typecho 文章导出工具
 - 通过 XML-RPC 拉取所有文章（含私密文章）
-- 转为 Markdown 上传到 Cloudflare R2
+- 转为 Markdown 上传到 Cloudflare R2（通过 Cloudflare API）
 """
 
 import xmlrpc.client
@@ -11,7 +11,7 @@ import os
 import re
 import sys
 import time
-import boto3
+import requests
 
 
 # ========== 配置（从环境变量读取）==========
@@ -19,12 +19,13 @@ TYPECHO_URL = os.environ["TYPECHO_URL"]
 USERNAME = os.environ["TYPECHO_USERNAME"]
 PASSWORD = os.environ["TYPECHO_PASSWORD"]
 
-R2_ACCOUNT_ID = os.environ["R2_ACCOUNT_ID"]
-R2_ACCESS_KEY_ID = os.environ["R2_ACCESS_KEY_ID"]
-R2_SECRET_ACCESS_KEY = os.environ["R2_SECRET_ACCESS_KEY"]
+CF_ACCOUNT_ID = os.environ["R2_ACCOUNT_ID"]
+CF_API_TOKEN = os.environ["R2_ACCESS_KEY_ID"]  # Cloudflare API Token (cfat_...)
 R2_BUCKET = os.environ["R2_BUCKET"]
 R2_PREFIX = os.environ.get("R2_PREFIX", "posts/")
 # ===========================================
+
+CF_API = f"https://api.cloudflare.com/client/v4/accounts/{CF_ACCOUNT_ID}/r2/buckets/{R2_BUCKET}"
 
 
 def get_xmlrpc_url(base_url):
@@ -116,6 +117,51 @@ def fetch_all_posts(proxy, blog_id, username, password):
     return all_posts
 
 
+def cf_headers():
+    return {"Authorization": f"Bearer {CF_API_TOKEN}"}
+
+
+def r2_list_keys(prefix):
+    """列出 R2 桶中指定前缀的所有 key"""
+    keys = set()
+    url = f"{CF_API}/objects"
+    params = {"prefix": prefix}
+    while True:
+        resp = requests.get(url, headers=cf_headers(), params=params)
+        data = resp.json()
+        if not data.get("success"):
+            print(f"  列表失败: {data.get('errors')}")
+            break
+        for obj in data.get("result", []):
+            keys.add(obj["key"])
+        # 分页
+        result_info = data.get("result_info", {})
+        if result_info.get("page", 0) >= result_info.get("total_pages", 1):
+            break
+        params["cursor"] = data.get("result", [{}])[-1].get("key", "")
+    return keys
+
+
+def r2_upload(key, content):
+    """上传文件到 R2"""
+    url = f"{CF_API}/objects/{key}"
+    resp = requests.put(
+        url,
+        headers={**cf_headers(), "Content-Type": "text/markdown; charset=utf-8"},
+        data=content.encode("utf-8"),
+    )
+    if not resp.json().get("success"):
+        print(f"  上传失败 {key}: {resp.json().get('errors')}")
+
+
+def r2_delete(key):
+    """删除 R2 中的文件"""
+    url = f"{CF_API}/objects/{key}"
+    resp = requests.delete(url, headers=cf_headers())
+    if not resp.json().get("success"):
+        print(f"  删除失败 {key}: {resp.json().get('errors')}")
+
+
 def main():
     rpc_url = get_xmlrpc_url(TYPECHO_URL)
     print(f"连接 Typecho XML-RPC: {rpc_url}")
@@ -138,21 +184,10 @@ def main():
         print("没有文章，退出。")
         return
 
-    # 初始化 R2
-    s3 = boto3.client(
-        "s3",
-        endpoint_url=f"https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com",
-        aws_access_key_id=R2_ACCESS_KEY_ID,
-        aws_secret_access_key=R2_SECRET_ACCESS_KEY,
-        region_name="auto",
-    )
-
-    # 拉取 R2 现有文件列表，用于清理已删除的文章
-    existing_keys = set()
-    paginator = s3.get_paginator("list_objects_v2")
-    for page in paginator.paginate(Bucket=R2_BUCKET, Prefix=R2_PREFIX):
-        for obj in page.get("Contents", []):
-            existing_keys.add(obj["Key"])
+    # 列出 R2 现有文件
+    print(f"R2 桶: {R2_BUCKET}，前缀: {R2_PREFIX}")
+    existing_keys = r2_list_keys(R2_PREFIX)
+    print(f"  桶中现有 {len(existing_keys)} 个文件")
 
     uploaded_keys = set()
 
@@ -166,19 +201,14 @@ def main():
         r2_key = f"{R2_PREFIX}{filename}"
         md = build_markdown(post)
 
-        s3.put_object(
-            Bucket=R2_BUCKET,
-            Key=r2_key,
-            Body=md.encode("utf-8"),
-            ContentType="text/markdown; charset=utf-8",
-        )
+        r2_upload(r2_key, md)
         uploaded_keys.add(r2_key)
         print(f"  [{i}/{len(posts)}] [{status}] {title} -> {r2_key}")
 
-    # 清理 R2 上已删除的文章
+    # 清理已删除的文章
     to_delete = existing_keys - uploaded_keys
     for key in to_delete:
-        s3.delete_object(Bucket=R2_BUCKET, Key=key)
+        r2_delete(key)
         print(f"  [删除] {key}")
 
     print(f"\n完成: 上传 {len(posts)} 篇, 清理 {len(to_delete)} 篇")
