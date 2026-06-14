@@ -79,12 +79,30 @@ def build_frontmatter(post):
     return "\n".join(lines)
 
 
-def build_markdown(post):
+def build_markdown(post, id_to_title=None):
     content_html = post.get("description", "")
     more_html = post.get("mt_text_more", "")
     if more_html:
         content_html += "\n" + more_html
     content_md = convert_html_to_md(content_html)
+
+    # 内链转 Obsidian 格式: [text](url) -> [[title]] 或 [[title|text]]
+    if id_to_title:
+        site = TYPECHO_URL.rstrip("/")
+        def replace_link(m):
+            text = m.group(1)
+            url = m.group(2)
+            match = re.search(r'/archives/(\d+)/', url)
+            if match:
+                pid = match.group(1)
+                if pid in id_to_title:
+                    target = id_to_title[pid]
+                    if text.strip() == target:
+                        return f"[[{target}]]"
+                    return f"[[{target}|{text}]]"
+            return m.group(0)
+        content_md = re.sub(r'\[([^\]]+)\]\(([^)]+)\)', replace_link, content_md)
+
     frontmatter = build_frontmatter(post)
     return f"{frontmatter}\n\n{content_md}"
 
@@ -190,6 +208,9 @@ def main():
     existing_keys = r2_list_keys(R2_PREFIX)
     print(f"  桶中现有 {len(existing_keys)} 个文件")
 
+    # 构建 post_id -> title 映射，用于内链转换
+    id_to_title = {p.get("postid", ""): p.get("title", "") for p in posts}
+
     uploaded_keys = set()
 
     for i, post in enumerate(posts, 1):
@@ -200,7 +221,7 @@ def main():
 
         filename = f"{post_id}_{slugify(title)}.md"
         r2_key = f"{R2_PREFIX}{filename}"
-        md = build_markdown(post)
+        md = build_markdown(post, id_to_title)
 
         r2_upload(r2_key, md)
         uploaded_keys.add(r2_key)
